@@ -31,3 +31,4 @@ extension = []
 [[bench]]
 name = "tokenizer"
 harness = false
+

@@ -46,22 +46,32 @@ fn signal_fts5_tokenize_internal(
 
     let mut normalized = String::with_capacity(1024);
 
+    // unicode_word_indices does not split on everything that we would like to turn into a token
+    // e.g. '.'. We are adding our own pass after segmentation.
     for (off, segment) in input.unicode_word_indices() {
-        normalize_into(segment, &mut normalized);
-        let rc = x_token(
-            p_ctx,
-            0,
-            normalized.as_bytes().as_ptr() as *const c_char,
-            normalized.len() as c_int,
-            off as c_int,
-            (off + segment.len()) as c_int,
-        );
-        if rc != SQLITE_OK {
-            return Err(rc);
+        let mut offset = off;
+        for word in segment.split(should_split_on) {
+            normalize_into(word, &mut normalized);
+            let rc = x_token(
+                p_ctx,
+                0,
+                normalized.as_bytes().as_ptr() as *const c_char,
+                normalized.len() as c_int,
+                offset as c_int,
+                (offset + word.len()) as c_int,
+            );
+            if rc != SQLITE_OK {
+                return Err(rc);
+            }
+            offset += word.len() + 1; // assumes should_split_on only returns true for single-byte chars
         }
     }
 
-    return Ok(());
+    Ok(())
+}
+
+fn should_split_on(c: char) -> bool {
+    c == '.'
 }
 
 fn is_diacritic(x: char) -> bool {
@@ -138,6 +148,42 @@ mod tests {
                 ("세상", 28, 34)
             ]
             .map(|(s, start, end)| (s.to_owned(), start, end))
+        );
+    }
+
+    #[test]
+    fn it_splits_on_dot() {
+        let input = "a.b.c";
+        let mut tokens: Vec<(String, c_int, c_int)> = vec![];
+        signal_fts5_tokenize_internal(
+            &mut tokens as *mut _ as *mut c_void,
+            input.as_bytes().as_ptr() as *const c_char,
+            input.len() as i32,
+            token_callback,
+        )
+        .expect("tokenize internal should not fail");
+
+        assert_eq!(
+            tokens,
+            [("a", 0, 1), ("b", 2, 3), ("c", 4, 5),].map(|(s, start, end)| (s.to_owned(), start, end))
+        );
+    }
+
+    #[test]
+    fn it_splits_on_at() {
+        let input = "a@b";
+        let mut tokens: Vec<(String, c_int, c_int)> = vec![];
+        signal_fts5_tokenize_internal(
+            &mut tokens as *mut _ as *mut c_void,
+            input.as_bytes().as_ptr() as *const c_char,
+            input.len() as i32,
+            token_callback,
+        )
+            .expect("tokenize internal should not fail");
+
+        assert_eq!(
+            tokens,
+            [("a", 0, 1), ("b", 2, 3)].map(|(s, start, end)| (s.to_owned(), start, end))
         );
     }
 
