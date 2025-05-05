@@ -11,8 +11,108 @@ mod extension;
 
 pub use crate::common::*;
 use libc::{c_char, c_int, c_uchar, c_void};
+use std::ffi::{CStr, CString};
+use std::ptr::null_mut;
 use unicode_normalization::UnicodeNormalization;
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{UnicodeSegmentation, UnicodeWordIndices};
+
+/// Wrapper for FFI
+/// Obtained from signal_tokenize(), must be freed by calling signal_tokenize_free()
+#[repr(C)]
+pub struct Tokenized {
+    data: Vec<*mut c_char>,
+}
+
+impl Drop for Tokenized {
+    fn drop(&mut self) {
+        let len = self.data.len();
+        // last one is null
+        let all_strings = &mut self.data[..len - 1];
+        for i in all_strings {
+            let _ = unsafe { CString::from_raw(*i) };
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn signal_tokenize(query: *const c_char) -> *mut Tokenized {
+    let query = unsafe { CStr::from_ptr(query) }
+        .to_str()
+        .expect("query was not utf-8");
+
+    let mut tokenizer: Vec<*mut c_char> = SignalTokenizer::new(query)
+        .map(|t| {
+            CString::new(t.1)
+                .expect("query should not contain an interior null byte")
+                .into_raw()
+        })
+        .collect();
+
+    tokenizer.push(null_mut());
+
+    let boxed = Box::new(Tokenized { data: tokenizer });
+    Box::into_raw(boxed)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn signal_tokenize_from_ptr(tokenized: &mut Tokenized) -> *const *mut c_char {
+    tokenized.data.as_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn signal_tokenize_free(tokenized: *mut Tokenized) {
+    if !tokenized.is_null() {
+        let _ = Box::from_raw(tokenized);
+    }
+}
+
+struct SignalTokenizer<'a> {
+    unicode_word_indices: UnicodeWordIndices<'a>,
+    current_word: &'a str,
+    current_offset: usize,
+}
+
+impl<'a> SignalTokenizer<'a> {
+    fn new(string: &'a str) -> SignalTokenizer<'a> {
+        SignalTokenizer {
+            unicode_word_indices: string.unicode_word_indices(),
+
+            // will be initialized in next()
+            current_word: "",
+            current_offset: 0,
+        }
+    }
+}
+
+// unicode_word_indices does not split on everything that we would like to turn into a token
+// e.g. '.'. We are adding our own pass after segmentation.
+impl<'a> Iterator for SignalTokenizer<'a> {
+    type Item = (usize, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current_word.is_empty() {
+            let (off, word) = self.unicode_word_indices.next()?;
+            self.current_offset = off;
+            self.current_word = word;
+        }
+
+        let old_offset = self.current_offset;
+        let word = match self.current_word.split_once(should_split_on) {
+            Some((word, next)) => {
+                self.current_word = next;
+                self.current_offset += word.len() + 1; // assumes should_split_on only returns true for single-byte chars
+                word
+            }
+            None => {
+                let word = std::mem::take(&mut self.current_word);
+                self.current_word = "";
+                word
+            }
+        };
+
+        Some((old_offset, word))
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn signal_fts5_tokenize(
@@ -46,24 +146,18 @@ fn signal_fts5_tokenize_internal(
 
     let mut normalized = String::with_capacity(1024);
 
-    // unicode_word_indices does not split on everything that we would like to turn into a token
-    // e.g. '.'. We are adding our own pass after segmentation.
-    for (off, segment) in input.unicode_word_indices() {
-        let mut offset = off;
-        for word in segment.split(should_split_on) {
-            normalize_into(word, &mut normalized);
-            let rc = x_token(
-                p_ctx,
-                0,
-                normalized.as_bytes().as_ptr() as *const c_char,
-                normalized.len() as c_int,
-                offset as c_int,
-                (offset + word.len()) as c_int,
-            );
-            if rc != SQLITE_OK {
-                return Err(rc);
-            }
-            offset += word.len() + 1; // assumes should_split_on only returns true for single-byte chars
+    for (offset, word) in SignalTokenizer::new(&input) {
+        normalize_into(word, &mut normalized);
+        let rc = x_token(
+            p_ctx,
+            0,
+            normalized.as_bytes().as_ptr() as *const c_char,
+            normalized.len() as c_int,
+            offset as c_int,
+            (offset + word.len()) as c_int,
+        );
+        if rc != SQLITE_OK {
+            return Err(rc);
         }
     }
 
@@ -165,7 +259,11 @@ mod tests {
 
         assert_eq!(
             tokens,
-            [("a", 0, 1), ("b", 2, 3), ("c", 4, 5),].map(|(s, start, end)| (s.to_owned(), start, end))
+            [("a", 0, 1), ("b", 2, 3), ("c", 4, 5),].map(|(s, start, end)| (
+                s.to_owned(),
+                start,
+                end
+            ))
         );
     }
 
@@ -179,7 +277,7 @@ mod tests {
             input.len() as i32,
             token_callback,
         )
-            .expect("tokenize internal should not fail");
+        .expect("tokenize internal should not fail");
 
         assert_eq!(
             tokens,
