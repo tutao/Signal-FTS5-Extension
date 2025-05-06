@@ -392,11 +392,13 @@ fn signal_fts_tokenizer_internal_init(
     let fts5_api = unsafe { p_fts5_api.as_ref() }
         .ok_or_else(|| Fts5InitError::new(SQLITE_INTERNAL, "FTS5 API was null"))?;
 
-    if fts5_api.i_version != FTS5_API_VERSION {
+    // Newer versions add locale-aware v2 versions of the tokenizer methods but we don't use them
+    // yet.
+    if fts5_api.i_version < FTS5_API_VERSION {
         return Err(Fts5InitError::new(
             SQLITE_MISUSE,
             format!(
-                "FTS5 API version mismatch {} != {FTS5_API_VERSION}",
+                "FTS5 API version mismatch {} < {FTS5_API_VERSION}",
                 fts5_api.i_version
             ),
         ));
