@@ -7,6 +7,7 @@ use crate::common::*;
 use crate::signal_fts5_tokenize;
 use core::ptr::null_mut;
 use libc::{c_char, c_int, c_uchar, c_void};
+use std::ffi::CString;
 
 pub struct Sqlite3 {}
 struct Sqlite3Stmt {}
@@ -259,7 +260,7 @@ pub struct Sqlite3APIRoutines {
     _bind_text64: extern "C" fn(),
     _cancel_auto_extension: extern "C" fn(),
     _load_extension: extern "C" fn(),
-    _malloc64: extern "C" fn(),
+    malloc64: extern "C" fn(u64) -> *mut c_char,
     _msize: extern "C" fn(),
     _realloc64: extern "C" fn(),
     _reset_auto_extension: extern "C" fn(),
@@ -300,28 +301,71 @@ pub struct Sqlite3APIRoutines {
 #[no_mangle]
 pub extern "C" fn signal_fts5_tokenizer_init(
     db: *mut Sqlite3,
-    _pz_err_msg: *mut *mut c_uchar,
+    pz_err_msg: *mut *mut c_char,
     p_api: *const c_void,
 ) -> c_int {
-    std::panic::catch_unwind(|| match signal_fts_tokenizer_internal_init(db, p_api) {
+    let result = std::panic::catch_unwind(|| signal_fts_tokenizer_internal_init(db, p_api))
+        .unwrap_or_else(|e| {
+            Err(Fts5InitError::new(
+                SQLITE_INTERNAL,
+                format!("Panicked! {e:?}"),
+            ))
+        });
+
+    match result {
         Ok(_) => SQLITE_OK,
-        Err(code) => code,
-    })
-    .unwrap_or(SQLITE_INTERNAL)
+        Err(Fts5InitError { code, message }) => {
+            if !pz_err_msg.is_null() && !p_api.is_null() {
+                let api = unsafe { (p_api as *const Sqlite3APIRoutines).as_ref() }
+                    .expect("was not null...");
+                let message = CString::new(message).unwrap().into_bytes_with_nul();
+                let into_message_ptr = (api.malloc64)(message.len() as u64);
+
+                if !into_message_ptr.is_null() {
+                    let allocated = unsafe {
+                        std::slice::from_raw_parts_mut(into_message_ptr as *mut u8, message.len())
+                    };
+                    allocated.copy_from_slice(message.as_slice());
+                    unsafe { *pz_err_msg = into_message_ptr };
+                }
+            }
+            code
+        }
+    }
 }
 
-fn signal_fts_tokenizer_internal_init(db: *mut Sqlite3, p_api: *const c_void) -> Result<(), c_int> {
-    let api = unsafe { (p_api as *const Sqlite3APIRoutines).as_ref() }.ok_or(SQLITE_INTERNAL)?;
+struct Fts5InitError {
+    code: c_int,
+    message: String,
+}
+
+impl Fts5InitError {
+    fn new<S: Into<String>>(code: c_int, message: S) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+fn signal_fts_tokenizer_internal_init(
+    db: *mut Sqlite3,
+    p_api: *const c_void,
+) -> Result<(), Fts5InitError> {
+    let api = unsafe { (p_api as *const Sqlite3APIRoutines).as_ref() }
+        .ok_or_else(|| Fts5InitError::new(SQLITE_INTERNAL, "Could not get sqlite3 api"))?;
 
     if (api.libversion_number)() < 302000 {
-        return Err(SQLITE_MISUSE);
+        return Err(Fts5InitError::new(
+            SQLITE_MISUSE,
+            format!("Invalid version number {}", (api.libversion_number)()),
+        ));
     }
 
     let mut stmt = null_mut::<Sqlite3Stmt>();
     let rc = (api.prepare)(db, "SELECT fts5(?1)\0".as_ptr(), -1, &mut stmt, null_mut());
 
     if rc != SQLITE_OK {
-        return Err(rc);
+        return Err(Fts5InitError::new(rc, "api.prepare failed"));
     }
 
     let mut p_fts5_api = null_mut::<FTS5API>();
@@ -334,7 +378,7 @@ fn signal_fts_tokenizer_internal_init(db: *mut Sqlite3, p_api: *const c_void) ->
     );
     if rc != SQLITE_OK {
         (api.finalize)(stmt);
-        return Err(rc);
+        return Err(Fts5InitError::new(rc, "api.bind_pointer failed"));
     }
 
     // Intentionally ignore return value, sqlite3 returns SQLITE_ROW
@@ -342,13 +386,20 @@ fn signal_fts_tokenizer_internal_init(db: *mut Sqlite3, p_api: *const c_void) ->
 
     let rc = (api.finalize)(stmt);
     if rc != SQLITE_OK {
-        return Err(rc);
+        return Err(Fts5InitError::new(rc, "finalize failed"));
     }
 
-    let fts5_api = unsafe { p_fts5_api.as_ref() }.ok_or(SQLITE_INTERNAL)?;
+    let fts5_api = unsafe { p_fts5_api.as_ref() }
+        .ok_or_else(|| Fts5InitError::new(SQLITE_INTERNAL, "FTS5 API was null"))?;
 
     if fts5_api.i_version != FTS5_API_VERSION {
-        return Err(SQLITE_MISUSE);
+        return Err(Fts5InitError::new(
+            SQLITE_MISUSE,
+            format!(
+                "FTS5 API version mismatch {} != {FTS5_API_VERSION}",
+                fts5_api.i_version
+            ),
+        ));
     }
 
     // Add custom tokenizer
@@ -366,7 +417,7 @@ fn signal_fts_tokenizer_internal_init(db: *mut Sqlite3, p_api: *const c_void) ->
         fts5_destroy_icu_module,
     );
 
-    return Ok(());
+    Ok(())
 }
 
 #[no_mangle]
