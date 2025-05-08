@@ -34,14 +34,14 @@ struct Fts5TokenizerApi {
     ) -> c_int,
 }
 
-type Sqlite3Malloc64 = extern "C" fn(u64) -> *mut c_char;
+type Sqlite3Malloc64 = extern "C" fn(u64) -> *mut c_void;
 
 type Sqlite3Prepare = extern "C" fn(
     db: *mut Sqlite3,
-    query: *const c_uchar,
+    query: *const c_char,
     query_len: c_int,
     stmt: *mut *mut Sqlite3Stmt,
-    pz_tail: *mut *mut c_uchar,
+    pz_tail: *mut *const c_char,
 ) -> c_int;
 
 type Sqlite3Finalize = extern "C" fn(stmt: *mut Sqlite3Stmt) -> c_int;
@@ -53,9 +53,9 @@ type Sqlite3Step = extern "C" fn(stmt: *mut Sqlite3Stmt) -> c_int;
 type Sqlite3BindPointer = extern "C" fn(
     stmt: *mut Sqlite3Stmt,
     index: c_int,
-    ptr: *mut *mut FTS5API,
-    name: *const c_uchar,
-    cb: *mut c_void,
+    ptr: *mut c_void,
+    name: *const c_char,
+    cb: Option<extern "C" fn(*mut c_void)>,
 ) -> c_int;
 
 #[repr(C)]
@@ -327,7 +327,7 @@ pub struct UsefulSqlite3ApiRoutines {
 /// We are doing this to be able to statically link against the extension but to still be able to
 /// compile extension without needing to compile C first.
 #[no_mangle]
-pub extern "C" fn fts5_tokenizer_init_static(
+pub extern "C" fn signal_fts5_tokenizer_init_static(
     db: *mut Sqlite3,
     pz_err_msg: *mut *mut c_char,
     api: &UsefulSqlite3ApiRoutines,
@@ -352,7 +352,7 @@ pub extern "C" fn fts5_tokenizer_init_static(
                         std::slice::from_raw_parts_mut(into_message_ptr as *mut u8, message.len())
                     };
                     allocated.copy_from_slice(message.as_slice());
-                    unsafe { *pz_err_msg = into_message_ptr };
+                    unsafe { *pz_err_msg = into_message_ptr as *mut c_char };
                 }
             }
             code
@@ -375,7 +375,7 @@ pub extern "C" fn signal_fts5_tokenizer_init(
         step: api.step,
         libversion_number: api.libversion_number,
     };
-    fts5_tokenizer_init_static(db, pz_err_msg, &api)
+    signal_fts5_tokenizer_init_static(db, pz_err_msg, &api)
 }
 
 struct Fts5InitError {
@@ -403,7 +403,7 @@ fn signal_fts_tokenizer_internal_init(
     }
 
     let mut stmt = null_mut::<Sqlite3Stmt>();
-    let rc = (api.prepare)(db, "SELECT fts5(?1)\0".as_ptr(), -1, &mut stmt, null_mut());
+    let rc = (api.prepare)(db, c"SELECT fts5(?1)".as_ptr(), -1, &mut stmt, null_mut());
 
     if rc != SQLITE_OK {
         return Err(Fts5InitError::new(rc, "api.prepare failed"));
@@ -413,9 +413,9 @@ fn signal_fts_tokenizer_internal_init(
     let rc = (api.bind_pointer)(
         stmt,
         1,
-        &mut p_fts5_api,
-        b"fts5_api_ptr\0".as_ptr(),
-        null_mut(),
+        &mut p_fts5_api as *mut _ as *mut c_void,
+        c"fts5_api_ptr".as_ptr(),
+        None,
     );
     if rc != SQLITE_OK {
         (api.finalize)(stmt);

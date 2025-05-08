@@ -18,7 +18,6 @@ use unicode_segmentation::{UnicodeSegmentation, UnicodeWordIndices};
 
 /// Wrapper for FFI
 /// Obtained from signal_tokenize(), must be freed by calling signal_tokenize_free()
-#[repr(C)]
 pub struct Tokenized {
     data: Vec<*mut c_char>,
 }
