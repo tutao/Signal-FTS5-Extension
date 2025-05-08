@@ -34,6 +34,30 @@ struct Fts5TokenizerApi {
     ) -> c_int,
 }
 
+type Sqlite3Malloc64 = extern "C" fn(u64) -> *mut c_char;
+
+type Sqlite3Prepare = extern "C" fn(
+    db: *mut Sqlite3,
+    query: *const c_uchar,
+    query_len: c_int,
+    stmt: *mut *mut Sqlite3Stmt,
+    pz_tail: *mut *mut c_uchar,
+) -> c_int;
+
+type Sqlite3Finalize = extern "C" fn(stmt: *mut Sqlite3Stmt) -> c_int;
+
+type Sqlite3LibversionNumber = extern "C" fn() -> c_int;
+
+type Sqlite3Step = extern "C" fn(stmt: *mut Sqlite3Stmt) -> c_int;
+
+type Sqlite3BindPointer = extern "C" fn(
+    stmt: *mut Sqlite3Stmt,
+    index: c_int,
+    ptr: *mut *mut FTS5API,
+    name: *const c_uchar,
+    cb: *mut c_void,
+) -> c_int;
+
 #[repr(C)]
 struct FTS5API {
     i_version: c_int, // Currently always set to 2
@@ -108,7 +132,7 @@ pub struct Sqlite3APIRoutines {
     _errmsg16: extern "C" fn(),
     _exec: extern "C" fn(),
     _expired: extern "C" fn(),
-    finalize: extern "C" fn(stmt: *mut Sqlite3Stmt) -> c_int,
+    finalize: Sqlite3Finalize,
     _free: extern "C" fn(),
     _free_table: extern "C" fn(),
     _get_autocommit: extern "C" fn(),
@@ -118,18 +142,12 @@ pub struct Sqlite3APIRoutines {
     _interruptx: extern "C" fn(),
     _last_insert_rowid: extern "C" fn(),
     _libversion: extern "C" fn(),
-    libversion_number: extern "C" fn() -> c_int,
+    libversion_number: Sqlite3LibversionNumber,
     _malloc: extern "C" fn(),
     _mprintf: extern "C" fn(),
     _open: extern "C" fn(),
     _open16: extern "C" fn(),
-    prepare: extern "C" fn(
-        db: *mut Sqlite3,
-        query: *const c_uchar,
-        query_len: c_int,
-        stmt: *mut *mut Sqlite3Stmt,
-        pz_tail: *mut *mut c_uchar,
-    ) -> c_int,
+    prepare: Sqlite3Prepare,
     _prepare16: extern "C" fn(),
     _profile: extern "C" fn(),
     _progress_handler: extern "C" fn(),
@@ -151,7 +169,7 @@ pub struct Sqlite3APIRoutines {
     _set_authorizer: extern "C" fn(),
     _set_auxdata: extern "C" fn(),
     _xsnprintf: extern "C" fn(),
-    step: extern "C" fn(stmt: *mut Sqlite3Stmt) -> c_int,
+    step: Sqlite3Step,
     _table_column_metadata: extern "C" fn(),
     _thread_cleanup: extern "C" fn(),
     _total_changes: extern "C" fn(),
@@ -260,7 +278,7 @@ pub struct Sqlite3APIRoutines {
     _bind_text64: extern "C" fn(),
     _cancel_auto_extension: extern "C" fn(),
     _load_extension: extern "C" fn(),
-    malloc64: extern "C" fn(u64) -> *mut c_char,
+    malloc64: Sqlite3Malloc64,
     _msize: extern "C" fn(),
     _realloc64: extern "C" fn(),
     _reset_auto_extension: extern "C" fn(),
@@ -289,22 +307,32 @@ pub struct Sqlite3APIRoutines {
     /* Version 3.20.0 and later */
     _prepare_v3: extern "C" fn(),
     _prepare16_v3: extern "C" fn(),
-    bind_pointer: extern "C" fn(
-        stmt: *mut Sqlite3Stmt,
-        index: c_int,
-        ptr: *mut *mut FTS5API,
-        name: *const c_uchar,
-        cb: *mut c_void,
-    ) -> c_int,
+    bind_pointer: Sqlite3BindPointer,
 }
 
+/// sqlite3 routines that are actually used by the tokenizer extension
+#[repr(C)]
+pub struct UsefulSqlite3ApiRoutines {
+    malloc64: Sqlite3Malloc64,
+    prepare: Sqlite3Prepare,
+    bind_pointer: Sqlite3BindPointer,
+    finalize: Sqlite3Finalize,
+    step: Sqlite3Step,
+    libversion_number: Sqlite3LibversionNumber,
+}
+
+/// Init sqlite3 without needing to access the whole sqlite3_api_routines vtable.
+/// Blessed (literally) way to write extensions is to use SQLITE_EXTENSION_INIT family of macros
+/// which uses vtable variable in scope instead of whatever is passed into the entry point.
+/// We are doing this to be able to statically link against the extension but to still be able to
+/// compile extension without needing to compile C first.
 #[no_mangle]
-pub extern "C" fn signal_fts5_tokenizer_init(
+pub extern "C" fn fts5_tokenizer_init_static(
     db: *mut Sqlite3,
     pz_err_msg: *mut *mut c_char,
-    p_api: *const c_void,
+    api: &UsefulSqlite3ApiRoutines,
 ) -> c_int {
-    let result = std::panic::catch_unwind(|| signal_fts_tokenizer_internal_init(db, p_api))
+    let result = std::panic::catch_unwind(|| signal_fts_tokenizer_internal_init(db, &api))
         .unwrap_or_else(|e| {
             Err(Fts5InitError::new(
                 SQLITE_INTERNAL,
@@ -315,9 +343,7 @@ pub extern "C" fn signal_fts5_tokenizer_init(
     match result {
         Ok(_) => SQLITE_OK,
         Err(Fts5InitError { code, message }) => {
-            if !pz_err_msg.is_null() && !p_api.is_null() {
-                let api = unsafe { (p_api as *const Sqlite3APIRoutines).as_ref() }
-                    .expect("was not null...");
+            if !pz_err_msg.is_null() {
                 let message = CString::new(message).unwrap().into_bytes_with_nul();
                 let into_message_ptr = (api.malloc64)(message.len() as u64);
 
@@ -332,6 +358,24 @@ pub extern "C" fn signal_fts5_tokenizer_init(
             code
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn signal_fts5_tokenizer_init(
+    db: *mut Sqlite3,
+    pz_err_msg: *mut *mut c_char,
+    p_api: *const c_void,
+) -> c_int {
+    let api = unsafe { (p_api as *const Sqlite3APIRoutines).as_ref() }.expect("was not null...");
+    let api = UsefulSqlite3ApiRoutines {
+        malloc64: api.malloc64,
+        prepare: api.prepare,
+        bind_pointer: api.bind_pointer,
+        finalize: api.finalize,
+        step: api.step,
+        libversion_number: api.libversion_number,
+    };
+    fts5_tokenizer_init_static(db, pz_err_msg, &api)
 }
 
 struct Fts5InitError {
@@ -349,11 +393,8 @@ impl Fts5InitError {
 }
 fn signal_fts_tokenizer_internal_init(
     db: *mut Sqlite3,
-    p_api: *const c_void,
+    api: &UsefulSqlite3ApiRoutines,
 ) -> Result<(), Fts5InitError> {
-    let api = unsafe { (p_api as *const Sqlite3APIRoutines).as_ref() }
-        .ok_or_else(|| Fts5InitError::new(SQLITE_INTERNAL, "Could not get sqlite3 api"))?;
-
     if (api.libversion_number)() < 302000 {
         return Err(Fts5InitError::new(
             SQLITE_MISUSE,
