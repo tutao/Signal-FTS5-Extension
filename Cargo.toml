@@ -18,6 +18,8 @@ lto = true
 [dependencies]
 unicode-segmentation = "1.10.1"
 unicode-normalization = "0.1.22"
+cbindgen = { version = "=0.28.0", optional = true, default-features = false }
+
 # libc without `std`
 libc = { version = "0.2", "default-features" = false, features = [] }
 
@@ -27,6 +29,12 @@ criterion = "0.5"
 [features]
 default = []
 extension = []
+cbindgen = ["dep:cbindgen"]
+
+[[bin]]
+name = "generate-header"
+required-features = ["cbindgen"]
+path = "generate-header/main.rs"
 
 [[bench]]
 name = "tokenizer"

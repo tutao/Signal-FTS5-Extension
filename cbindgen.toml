@@ -29,6 +29,3 @@ item_types = ["functions", "opaque", "structs", "typedefs"]
 "Sqlite3" = "sqlite3"
 "Sqlite3APIRoutines" = "sqlite3_api_routines"
 "TokenFunction" = "sqlite3__fts5_token_fn"
-
-[defines]
-"feature = extension" = "SIGNAL_FTS5_TOKENIZER_EXTENSION_H_"
